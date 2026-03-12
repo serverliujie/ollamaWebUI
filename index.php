@@ -1,0 +1,989 @@
+<?php
+	 
+// 强制设置 PHP 运行时配置（覆盖 php.ini，部分环境需权限）
+ini_set('post_max_size', '64M');
+ini_set('upload_max_filesize', '64M');
+ini_set('memory_limit', '128M');
+ini_set('max_execution_time', '300');
+ini_set('max_input_time', '300');
+ini_set('default_socket_timeout', '0'); // 套接字不超时
+/**
+ * PHP 版本的 Ollama Web UI
+ * 这是一个基于 PHP 的 Web 界面，用于与 Ollama AI 模型进行交互
+ * 功能包括：模型列表、单次对话、连续对话、模型卸载等
+ */
+
+// 配置 Ollama 服务器地址
+// 优先使用环境变量 OLLAMA_BASE，否则使用默认地址 http://localhost:11434
+$OLLAMA_BASE = getenv('OLLAMA_BASE') ?: 'http://localhost:11434';
+
+// 获取当前请求的 URI 和方法
+$request_uri = $_SERVER['REQUEST_URI'];
+$request_method = $_SERVER['REQUEST_METHOD'];
+
+// ========== API 端点：获取模型列表 ==========
+// 路由：GET /api/tags
+// 功能：从 Ollama 服务器获取所有可用的模型列表
+if ($request_uri === '/api/tags' && $request_method === 'GET') {
+    header('Content-Type: application/json');
+    try {
+        // 初始化 cURL 请求
+        $ch = curl_init("$OLLAMA_BASE/api/tags");
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 5);
+        
+        // 执行请求并获取响应
+        $response = curl_exec($ch);
+        $http_code = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+
+        // curl_close($ch); // PHP 8.5 中已弃用，自动释放
+        
+        // 如果请求成功，返回模型列表；否则返回空数组
+        if ($http_code === 200) {
+            echo $response;
+        } else {
+            echo json_encode(["models" => []]);
+        }
+    } catch (Exception $e) {
+        // 出错时返回空模型列表
+        echo json_encode(["models" => []]);
+    }
+    exit;
+}
+
+// ========== API 端点：生成回复（流式） ==========
+// 路由：POST /api/generate
+// 功能：向 Ollama 发送提示词，获取流式回复
+if ($request_uri === '/api/generate' && $request_method === 'POST') {
+    // 设置响应头为 NDJSON 格式，支持流式传输
+    header('Content-Type: application/x-ndjson');
+    header('Cache-Control: no-cache');
+    header('X-Accel-Buffering: no');
+    
+    // 读取原始 POST 数据
+    $raw_input = file_get_contents('php://input');
+    
+    // 修复 UTF-8 编码问题（处理中文字符）
+    if (function_exists('mb_convert_encoding')) {
+        // 尝试检测并转换编码
+        $encoding = mb_detect_encoding($raw_input, ['UTF-8', 'ISO-8859-1', 'Windows-1252'], true);
+        if ($encoding && $encoding !== 'UTF-8') {
+            $raw_input = mb_convert_encoding($raw_input, 'UTF-8', $encoding);
+        }
+    }
+    
+    // 解析 JSON 数据
+    $data = json_decode($raw_input, true, 512, JSON_THROW_ON_ERROR);
+    
+    try {
+        // 初始化 cURL 请求到 Ollama 的 generate 端点
+        $ch = curl_init("$OLLAMA_BASE/api/generate");
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 0);
+        
+        // 设置写入函数，实现流式输出
+        curl_setopt($ch, CURLOPT_WRITEFUNCTION, function($ch, $data) {
+            echo $data;
+            flush();  // 立即输出到浏览器
+            return strlen($data);
+        });
+        
+        // 执行请求
+        curl_exec($ch);
+        // curl_close($ch); // PHP 8.5 中已弃用
+    } catch (Exception $e) {
+        // 出错时返回完成状态
+        echo json_encode(["done" => true]);
+    }
+    exit;
+}
+
+// ========== API 端点：聊天对话（流式） ==========
+// 路由：POST /api/chat
+// 功能：向 Ollama 发送对话历史，获取流式回复（支持多轮对话）
+if ($request_uri === '/api/chat' && $request_method === 'POST') {
+    // 设置响应头为 NDJSON 格式，支持流式传输
+    header('Content-Type: application/x-ndjson');
+    header('Cache-Control: no-cache');
+    header('X-Accel-Buffering: no');
+    
+    // 读取原始 POST 数据
+    $raw_input = file_get_contents('php://input');
+    
+    // 修复 UTF-8 编码问题（处理中文字符）
+    if (function_exists('mb_convert_encoding')) {
+        $encoding = mb_detect_encoding($raw_input, ['UTF-8', 'ISO-8859-1', 'Windows-1252'], true);
+        if ($encoding && $encoding !== 'UTF-8') {
+            $raw_input = mb_convert_encoding($raw_input, 'UTF-8', $encoding);
+        }
+    }
+    
+    // 解析 JSON 数据
+    $data = json_decode($raw_input, true, 512, JSON_THROW_ON_ERROR);
+    
+    try {
+        // 初始化 cURL 请求到 Ollama 的 chat 端点
+        $ch = curl_init("$OLLAMA_BASE/api/chat");
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode($data));
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, false);
+        curl_setopt($ch, CURLOPT_TIMEOUT, 0);
+        
+        // 设置写入函数，实现流式输出
+        curl_setopt($ch, CURLOPT_WRITEFUNCTION, function($ch, $data) {
+            echo $data;
+            flush();  // 立即输出到浏览器
+            return strlen($data);
+        });
+        
+        // 执行请求
+        curl_exec($ch);
+        // curl_close($ch); // PHP 8.5 中已弃用
+    } catch (Exception $e) {
+        // 出错时返回完成状态
+        echo json_encode(["done" => true]);
+    }
+    exit;
+}
+
+// ========== API 端点：卸载模型 ==========
+// 路由：POST /api/unload-model
+// 功能：卸载指定的模型，释放内存资源
+if ($request_uri === '/api/unload-model' && $request_method === 'POST') {
+    header('Content-Type: application/json');
+    
+    // 读取原始 POST 数据
+    $raw_input = file_get_contents('php://input');
+    
+    // 修复 UTF-8 编码问题
+    if (function_exists('mb_convert_encoding')) {
+        $encoding = mb_detect_encoding($raw_input, ['UTF-8', 'ISO-8859-1', 'Windows-1252'], true);
+        if ($encoding && $encoding !== 'UTF-8') {
+            $raw_input = mb_convert_encoding($raw_input, 'UTF-8', $encoding);
+        }
+    }
+    
+    // 解析 JSON 数据
+    $data = json_decode($raw_input, true, 512, JSON_THROW_ON_ERROR);
+    $model_name = $data['model'] ?? '';
+    
+    // 验证模型名称不能为空
+    if (empty($model_name)) {
+        http_response_code(400);
+        echo json_encode(['error' => '模型名称不能为空']);
+        exit;
+    }
+    
+    try {
+        // 通过向 generate 端点发送空提示并设置 keep_alive=0 来卸载模型
+        $ch = curl_init("$OLLAMA_BASE/api/generate");
+        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, json_encode([
+            'model' => $model_name,
+            'keep_alive' => 0,
+            'prompt' => ''
+        ]));
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+        $response = curl_exec($ch);
+        // curl_close($ch); // PHP 8.5 中已弃用
+        
+        echo json_encode(['status' => 'success', 'model' => $model_name]);
+    } catch (Exception $e) {
+        http_response_code(500);
+        echo json_encode(['error' => $e->getMessage()]);
+    }
+    exit;
+}
+
+// ========== Web 界面 ==========
+// 对于所有其他 GET 请求，返回 HTML 界面
+if ($request_method === 'GET') {header('Content-Type: text/html; charset=utf-8');?>
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>🤖 离线AI 小助手</title>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body { 
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #0f0f11; color: #e3e3e3; min-height: 100vh; padding: 20px;
+            overflow: hidden;
+            -webkit-overflow-scrolling: touch;
+            touch-action: manipulation;
+            -webkit-text-size-adjust: 100%;
+        }
+        
+        @media (max-width: 600px) {
+            body { padding: 8px; }
+            h1 { font-size: 18px; margin-bottom: 10px; }
+            .top-bar { margin-bottom: 10px; }
+            .status { padding: 8px 10px !important; font-size: 12px; }
+            .model-select, .mode-select { padding: 8px !important; font-size: 13px !important; }
+            .messages { padding: 10px !important; gap: 8px !important; }
+            .message { padding: 8px 10px !important; font-size: 14px !important; }
+            .input-area { padding: 8px !important; gap: 8px !important; }
+            #userInput { padding: 10px !important; font-size: 15px !important; min-height: 40px; }
+            .send-btn { padding: 8px 12px !important; min-width: 60px !important; height: 40px !important; }
+            .send-text { font-size: 13px !important; }
+        }
+        .container { max-width: 900px; margin: 0 auto; height: calc(100vh - 40px); display: flex; flex-direction: column; }
+        h1 { text-align: center; margin-bottom: 20px; color: #00d9ff; font-weight: 300; flex-shrink: 0; }
+        
+        .top-bar { 
+            display: flex; gap: 10px; margin-bottom: 20px; flex-wrap: wrap; flex-shrink: 0; align-items: center;
+        }
+        .status { 
+            flex: 1; min-width: 200px; padding: 12px 15px; border-radius: 10px;
+            background: #1a1a1d; display: flex; align-items: center; gap: 10px; border: 1px solid #2d2d33;
+        }
+        .status-dot { width: 12px; height: 12px; border-radius: 50%; background: #ff4444; flex-shrink: 0; }
+        .status-dot.connected { background: #00ff88; }
+        
+        .model-select, .mode-select { 
+            padding: 12px; border-radius: 10px;
+            background: #1a1a1d; color: #e3e3e3; border: 1px solid #2d2d33; font-size: 14px;
+            transition: 0.2s;
+        }
+        .model-select { flex: 2; min-width: 150px; }
+        .mode-select { flex: 1; min-width: 120px; }
+        .model-select:focus, .mode-select:focus {
+            border-color: #00d9ff; outline: none;
+        }
+        
+        .chat-container { 
+            background: #1a1a1d; border-radius: 14px; overflow: hidden; flex: 1;
+            display: flex; flex-direction: column; border: 1px solid #2d2d33; min-height: 0;
+        }
+        .messages { 
+            flex: 1; overflow-y: auto; padding: 20px; display: flex; flex-direction: column; gap: 12px;
+            scroll-behavior: smooth;
+        }
+        
+        .message-wrapper {
+            display: flex;
+            flex-direction: column;
+            gap: 4px;
+        }
+        .message-wrapper.user {
+            align-items: flex-end;
+        }
+        .message-wrapper.assistant {
+            align-items: flex-start;
+        }
+        
+        .message-header {
+            display: flex; align-items: center; gap: 8px; font-size: 10px; color: #777;
+        }
+        .message-header .time {
+            color: #888;
+        }
+        .message-header .tts-btn {
+            background: #25252b; border: none; color: #00d9ff; cursor: pointer;
+            padding: 3px 7px; border-radius: 5px; font-size: 12px;
+            display: none;
+        }
+        .message-header .tts-btn.show {
+            display: inline-block;
+        }
+        .message-header .fold-btn {
+            background: #25252b; border: none; color: #888; cursor: pointer;
+            padding: 3px 7px; border-radius: 5px; font-size: 10px;
+        }
+        .message-header .fold-btn:hover {
+            background: #2d2d35;
+        }
+        
+        .message { 
+            max-width: 90%; padding: 12px 16px; border-radius: 14px; line-height: 1.6;
+            word-wrap: break-word; transition: 0.2s ease; font-size: 14px;
+            white-space: pre-wrap;
+            word-break: break-all;
+            position: relative;
+        }
+        .message.user { 
+            background: #2563eb; 
+        }
+        .message.assistant { 
+            background: #25252b; border: 1px solid #2d2d33;
+        }
+        .message.interrupted { 
+            border-left: 3px solid #dc2626;
+        }
+        
+        .message.folded {
+            max-height: 60px;
+            overflow: hidden;
+            position: relative;
+        }
+        
+        .message.folded::after {
+            content: '...';
+            position: absolute;
+            bottom: 0;
+            left: 0;
+            right: 0;
+            height: 28px;
+            background: linear-gradient(transparent, #25252b);
+            pointer-events: none;
+            display: flex;
+            align-items: flex-end;
+            justify-content: center;
+            padding-bottom: 6px;
+            color: #666;
+            font-size: 14px;
+            font-weight: 500;
+            letter-spacing: 2px;
+        }
+        
+        .message-wrapper.folded .fold-btn {
+            color: #00d9ff !important;
+        }
+        
+        .input-area { 
+            display: flex; gap: 10px; padding: 12px; background: #141417; border-top: 1px solid #2d2d33;
+            align-items: center; flex-shrink: 0;
+        }
+
+        #userInput { 
+            flex: 1; padding: 12px; border-radius: 10px; background: #25252b; 
+            color: #e3e3e3; border: 1px solid #384242; font-size: 16px; outline: none;
+            transition: 0.2s; resize: none;
+            height: 44px !important;
+            line-height: 1.4; font-family: inherit;
+            white-space: pre-wrap;
+            -webkit-appearance: none;
+            overflow: hidden !important;
+            scrollbar-width: none !important;
+        }
+        #userInput::-webkit-scrollbar {
+            display: none !important;
+        }
+        #userInput:focus { border-color: #00d9ff; }
+        #userInput:disabled { opacity: 0.5; cursor: not-allowed; }
+        #userInput::placeholder { font-size: 14px; }
+
+        .send-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            background: #2563eb;
+            border-radius: 10px;
+            padding: 10px 16px;
+            min-width: 70px;
+            height: 44px;
+            cursor: pointer;
+            transition: 0.2s;
+            border: 1px solid #2563eb;
+            white-space: nowrap;
+            touch-action: manipulation;
+            -webkit-tap-highlight-color: transparent;
+            user-select: none;
+            -webkit-touch-callout: none;
+        }
+        .send-btn:hover {
+            background: #1d4ed8;
+        }
+        .send-btn:active {
+            background: #1e40af;
+            transform: scale(0.96);
+        }
+        .send-btn.stop {
+            background: #dc2626;
+            border-color: #dc2626;
+        }
+        .send-btn.stop:hover {
+            background: #b91c1c;
+        }
+        .send-btn:disabled {
+            background: #33333b;
+            border-color: #33333b;
+            cursor: not-allowed;
+        }
+
+        .send-text {
+            color: white;
+            font-size: 14px;
+            font-weight: 500;
+        }
+
+        .typing-indicator-loading {
+            display: inline-flex; gap: 4px; padding: 4px 8px;
+        }
+        .typing-indicator-loading span {
+            width: 6px; height: 6px; background: #777; border-radius: 50%;
+            animation: bounce 1.4s infinite ease-in-out both;
+        }
+        .typing-indicator-loading span:nth-child(1) { animation-delay: -0.32s; }
+        .typing-indicator-loading span:nth-child(2) { animation-delay: -0.16s; }
+        
+        @keyframes bounce {
+            0%, 80%, 100% { transform: scale(0); }
+            40% { transform: scale(1); }
+        }
+
+        pre {
+            background: #1e1e2e;
+            padding: 12px 16px;
+            border-radius: 8px;
+            overflow-x: auto;
+            margin: 8px 0;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 13px;
+            line-height: 1.5;
+            position: relative;
+        }
+        code {
+            background: #2d2d3f;
+            padding: 2px 6px;
+            border-radius: 4px;
+            font-family: 'Consolas', 'Monaco', monospace;
+            font-size: 13px;
+        }
+        pre code {
+            background: transparent;
+            padding: 0;
+            border-radius: 0;
+        }
+
+        .copy-btn {
+            position: absolute;
+            top: 8px; right: 12px;
+            background: #333; color: #fff; border: none; border-radius: 4px;
+            padding: 4px 8px; font-size: 12px; cursor: pointer; z-index: 10;
+        }
+        .copy-btn:hover { background: #444; }
+        .copy-btn.copied { background: #10b981; }
+
+        .mjx-chtml { font-size: 100% !important; }
+    </style>
+    <script id="MathJax-script" async src="https://cdn.jsdelivr.net/npm/mathjax@3/es5/tex-mml-chtml.js"></script>
+</head>
+<body>
+    <div class="container">
+        <h1>🤖 离线AI 小助手</h1>
+        
+        <div class="top-bar">
+            <div class="status">
+                <div class="status-dot" id="statusDot"></div>
+                <span id="statusText">正在连接...</span>
+            </div>
+            <select class="model-select" id="modelSelect">
+                <option value="">加载模型中...</option>
+            </select>
+            <select class="mode-select" id="modeSelect">
+                <option value="generate">🗨️ 单次对话</option>
+                <option value="chat">🔄 连续对话</option>
+            </select>
+        </div>
+        
+        <div class="chat-container">
+            <div class="messages" id="messages"></div>
+            <div class="input-area">
+                <textarea id="userInput" placeholder="输入问题，Shift+Enter 换行" enterkeyhint="send" inputmode="text"></textarea>
+                
+                <div class="send-btn" id="sendBtn">
+                    <span class="send-text">发送</span>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // API 基础路径（为空表示使用当前域名）
+        const API_BASE = '';
+        // 当前选中的模型
+        let selectedModel = '';
+        // 当前对话模式：'generate'（单次对话）或 'chat'（连续对话）
+        let selectedMode = 'generate';
+        // 是否正在生成回复
+        let isGenerating = false;
+        // 当前请求的控制器（用于中断请求）
+        let currentController = null;
+        // 聊天历史记录
+        let chatHistory = [];
+        // 是否已中断请求
+        let isAborted = false;
+        // 当前加载中的消息包装器
+        let currentLoadingWrapper = null;
+
+        // 保存配置到 localStorage
+        function saveConfig() {
+            localStorage.setItem('ai_model', selectedModel);
+            localStorage.setItem('ai_mode', selectedMode);
+            localStorage.setItem('ai_history', JSON.stringify(chatHistory));
+        }
+
+        // 从 localStorage 加载配置
+        function loadConfig() {
+            const model = localStorage.getItem('ai_model');
+            const mode = localStorage.getItem('ai_mode');
+            const history = localStorage.getItem('ai_history');
+            if (model) selectedModel = model;
+            if (mode) selectedMode = mode;
+            if (history) chatHistory = JSON.parse(history);
+            document.getElementById('modeSelect').value = selectedMode;
+        }
+
+        loadConfig();
+
+        // 检查服务器状态并加载模型列表
+        async function checkStatus() {
+            try {
+                const response = await fetch(`${API_BASE}/api/tags`, { cache: 'no-store' });
+                if (response.ok) {
+                    const data = await response.json();
+                    const models = data.models || [];
+                    const select = document.getElementById('modelSelect');
+					select.innerHTML = models.map(m => {
+					  const bytes = m.size;
+					  const mb = bytes / 1024 / 1024;
+					  let sizeText;
+					  
+					  if (mb > 999) {
+						// 大于999M → 显示 GB
+						const gb = (mb / 1024).toFixed(2);
+						sizeText = `${gb} GB`;
+					  } else {
+						// 小于等于999M → 显示 MB
+						sizeText = `${mb.toFixed(2)} MB`;
+					  }
+
+					  return `<option value="${m.name}">${m.name} 【${sizeText}】</option>`;
+					}).join('');
+                    if (selectedModel) {
+                        select.value = selectedModel;
+                    } else if (models.length === 1) {
+                        selectedModel = models[0].name;
+                        select.value = selectedModel;
+                    }
+                    document.getElementById('statusDot').classList.add('connected');
+                    document.getElementById('statusText').textContent = `运行中 - ${models.length} 个模型`;
+                    
+                    renderHistory();
+                } else {
+                    document.getElementById('statusDot').classList.remove('connected');
+                    document.getElementById('statusText').textContent = '连接失败';
+                }
+            } catch (e) {
+                document.getElementById('statusDot').classList.remove('connected');
+                document.getElementById('statusText').textContent = '连接失败';
+            }
+        }
+
+        function renderHistory() {
+            if (chatHistory.length === 0) return;
+            const messagesEl = document.getElementById('messages');
+            messagesEl.innerHTML = '';
+            for (const msg of chatHistory) {
+                addMessage(msg.content, msg.role, getTimeString());
+            }
+        }
+
+        document.getElementById('modelSelect').addEventListener('click', (e) => {
+            e.stopPropagation();
+        });
+        
+        document.getElementById('modelSelect').addEventListener('change', async (e) => {
+            const newModel = e.target.value;
+            if (newModel === selectedModel && isGenerating === false) {
+                return;
+            }
+            if (isGenerating) {
+                if (!confirm('正在生成中，切换模型将中断当前对话并关闭原有模型。确定要切换吗？')) {
+                    e.target.value = selectedModel;
+                    return;
+                }
+                stopGeneration();
+            }
+            
+            if (selectedModel && selectedModel !== newModel) {
+                try {
+                    e.target.disabled = true;
+                    await fetch(`${API_BASE}/api/unload-model`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ model: selectedModel })
+                    }).catch(()=>{});
+                } catch (err) {}
+                finally {
+                    e.target.disabled = false;
+                }
+            }
+            
+            selectedModel = newModel;
+            chatHistory = [];
+            isGenerating = false;
+            updateSendButton(isGenerating);
+            document.getElementById('messages').innerHTML = '';
+            saveConfig();
+        });
+
+        document.getElementById('modeSelect').addEventListener('click', (e) => {
+            e.stopPropagation();
+        });
+
+        document.getElementById('modeSelect').addEventListener('change', (e) => {
+            const newMode = e.target.value;
+            if (newMode === selectedMode && !isGenerating) {
+                return;
+            }
+            if (isGenerating) {
+                if (!confirm('正在生成中，切换模式将中断当前对话。确定要切换吗？')) {
+                    e.target.value = selectedMode;
+                    return;
+                }
+                stopGeneration();
+            }
+            selectedMode = e.target.value;
+            chatHistory = [];
+            isGenerating = false;
+            updateSendButton(isGenerating);
+            document.getElementById('messages').innerHTML = '';
+            saveConfig();
+        });
+        
+        function addCopyButtons() {
+            document.querySelectorAll('pre').forEach(pre => {
+                if (pre.querySelector('.copy-btn')) return;
+                const btn = document.createElement('button');
+                btn.className = 'copy-btn';
+                btn.textContent = '复制';
+                pre.appendChild(btn);
+                
+                btn.onclick = () => {
+                    try {
+                        const codeText = pre.querySelector('code').textContent;
+                        const textArea = document.createElement('textarea');
+                        textArea.value = codeText;
+                        document.body.appendChild(textArea);
+                        textArea.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(textArea);
+                        
+                        btn.textContent = '已复制';
+                        btn.classList.add('copied');
+                        setTimeout(() => {
+                            btn.textContent = '复制';
+                            btn.classList.remove('copied');
+                        }, 1500);
+                    } catch (err) {
+                        btn.textContent = '失败';
+                        setTimeout(() => btn.textContent = '复制', 1500);
+                    }
+                };
+            });
+        }
+
+        function escapeHtml(text) {
+            const div = document.createElement('div');
+            div.textContent = text;
+            let html = div.innerHTML;
+            html = html.replace(/```([\s\S]*?)```/g, (m, c) => `<pre><code>${c}</code></pre>`);
+            html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
+            return html;
+        }
+
+        function renderContent(text) {
+            const html = escapeHtml(text);
+            setTimeout(() => {
+                addCopyButtons();
+                if (window.MathJax) MathJax.typeset();
+            }, 0);
+            return html;
+        }
+
+        function getTimeString() {
+            const now = new Date();
+            return now.getHours().toString().padStart(2,'0')+':'+now.getMinutes().toString().padStart(2,'0');
+        }
+
+        function speakText(text, btn) {
+            if (!('speechSynthesis' in window)) return;
+            window.speechSynthesis.cancel();
+            
+            const isPlaying = btn.dataset.playing === 'true';
+            if (isPlaying) {
+                btn.textContent = '🔈';
+                btn.dataset.playing = 'false';
+                return;
+            }
+            
+            const u = new SpeechSynthesisUtterance(text);
+            u.lang = 'zh-CN';
+            u.onend = () => { 
+                btn.textContent = '🔈'; 
+                btn.dataset.playing = 'false';
+            };
+            u.onerror = () => { 
+                btn.textContent = '🔈'; 
+                btn.dataset.playing = 'false';
+            };
+            window.speechSynthesis.speak(u);
+            btn.textContent = '🔊';
+            btn.dataset.playing = 'true';
+        }
+
+        function toggleFold(btn) {
+            const msgWrapper = btn.closest('.message-wrapper');
+            const msg = msgWrapper.querySelector('.message');
+            msg.classList.toggle('folded');
+            msgWrapper.classList.toggle('folded');
+            btn.textContent = msg.classList.contains('folded') ? '▼ 展开' : '▲ 折叠';
+        }
+
+        function updateSendButton(gen) {
+            const btn = document.getElementById('sendBtn');
+            const t = btn.querySelector('.send-text');
+            if (gen) { t.textContent='中断'; btn.classList.add('stop'); }
+            else { t.textContent='发送'; btn.classList.remove('stop'); }
+        }
+
+        function setInputEnabled(enable) {
+            const i = document.getElementById('userInput');
+            const b = document.getElementById('sendBtn');
+            i.disabled = !enable;
+            b.disabled = !enable;
+            isGenerating = !enable;
+            updateSendButton(isGenerating);
+        }
+
+        function scrollToBottom() {
+            const m = document.getElementById('messages');
+            m.scrollTop = m.scrollHeight;
+        }
+
+        function stopGeneration() {
+            isAborted = true;
+            if (currentController) { 
+                try { currentController.abort(); } catch(e){}
+                currentController = null; 
+            }
+
+            if (currentLoadingWrapper) {
+                const load = currentLoadingWrapper.querySelector('#loadingMsg');
+                const dots = load?.querySelector('.typing-indicator-loading');
+                if (dots) dots.remove();
+                if (load) load.innerHTML += ' <span style="color:#dc2626">🛑 已中断</span>';
+            }
+
+            isGenerating = false;
+            currentLoadingWrapper = null;
+            updateSendButton(false);
+            setInputEnabled(true);
+        }
+
+        function handleSendOrStop() {
+            if (isGenerating) stopGeneration();
+            else sendMessage();
+        }
+
+        function createTypingIndicator() {
+            const d = document.createElement('div');
+            d.className='typing-indicator-loading';
+            d.innerHTML='<span></span><span></span><span></span>';
+            return d;
+        }
+
+        async function sendMessage() {
+            const input = document.getElementById('userInput');
+            const text = input.value.trim();
+            if (isGenerating || !text || !selectedModel) {
+                if (!selectedModel) alert('请先选择一个模型');
+                return;
+            }
+
+            isAborted = false;
+            setInputEnabled(false);
+            addMessage(text, 'user', getTimeString());
+            input.value = '';
+
+            const wrapper = document.createElement('div');
+            wrapper.className = 'message-wrapper assistant';
+            const loadingDiv = document.createElement('div');
+            loadingDiv.className = 'message assistant';
+            loadingDiv.id = 'loadingMsg';
+            loadingDiv.appendChild(createTypingIndicator());
+
+            currentLoadingWrapper = wrapper;
+            wrapper.innerHTML = `
+                <div class="message-header">
+                    <span class="time">${getTimeString()}</span>					
+                    <button class="tts-btn show" title="朗读">🔈</button>
+                    <button class="fold-btn" title="折叠">▲ 折叠</button>
+                </div>
+            `;
+            wrapper.appendChild(loadingDiv);
+            document.getElementById('messages').appendChild(wrapper);
+            scrollToBottom();
+
+            wrapper.querySelector('.tts-btn').onclick = () => speakText(loadingDiv.innerText, wrapper.querySelector('.tts-btn'));
+            wrapper.querySelector('.fold-btn').onclick = (e) => toggleFold(e.target);
+
+            currentController = new AbortController();
+
+            try {
+                let body, endpoint;
+                if (selectedMode === 'chat') {
+                    chatHistory.push({role:'user', content:text});
+                    body = {model:selectedModel, messages:chatHistory, stream:true,think:false};
+                    endpoint = '/api/chat';
+                } else {
+                    body = {model:selectedModel, prompt:text, stream:true,think:false};
+                    endpoint = '/api/generate';
+                }
+
+                const resp = await fetch(API_BASE+endpoint, {
+                    method:'POST',
+                    headers:{'Content-Type':'application/json'},
+                    body:JSON.stringify(body),
+                    signal:currentController.signal
+                });
+
+                if (!resp.ok) {
+                    const dots = wrapper.querySelector('.typing-indicator-loading');
+                    if (dots) dots.remove();
+                    try {
+                        const errData = await resp.json();
+                        loadingDiv.innerHTML = `<span style="color:#ff4444">${errData.error || '请求失败'}</span>`;
+                    } catch {
+                        loadingDiv.innerHTML = `<span style="color:#ff4444">请求失败 (${resp.status})</span>`;
+                    }
+                    scrollToBottom();
+                    currentController = null;
+                    currentLoadingWrapper = null;
+                    setInputEnabled(true);
+                    input.focus();
+                    return;
+                }
+
+                const reader = resp.body.getReader();
+                const dec = new TextDecoder();
+                let buf = '', hasContent = false;
+
+                while(true) {
+                    const {done, value} = await reader.read();
+                    if (done || isAborted) break;
+
+                    const chunk = dec.decode(value);
+                    const lines = chunk.split('\n').filter(i=>i.trim());
+
+                    for(const line of lines) {
+                        if (!line || isAborted) continue;
+                        try {
+                            const d = JSON.parse(line);
+                            
+                            if (d.error) {
+                                isAborted = true;
+                                const dots = wrapper.querySelector('.typing-indicator-loading');
+                                if (dots) dots.remove();
+                                loadingDiv.innerHTML = `<span style="color:#ff4444">${d.error}</span>`;
+                                scrollToBottom();
+                                break;
+                            }
+                            
+                            let c = '';
+                            if (selectedMode==='chat') {
+                                c = d.message?.content || '';
+                            } else {
+                                c = d.response || '';
+                            }
+
+                            if (c && !isAborted) {
+                                if (!hasContent) { hasContent = true; loadingDiv.innerHTML = ''; }
+                                buf += c;
+                                loadingDiv.innerHTML = renderContent(buf);
+                                scrollToBottom();
+                            }
+                        } catch(e){}
+                    }
+                }
+
+                const dots = loadingDiv.querySelector('.typing-indicator-loading');
+                if (dots) dots.remove();
+
+                if (!isAborted && selectedMode==='chat') {
+                    chatHistory.push({role:'assistant', content:buf});
+                    saveConfig();
+                }
+
+            } catch (e) {
+                const dots = wrapper.querySelector('.typing-indicator-loading');
+                if (dots) dots.remove();
+                if (!isAborted && loadingDiv) {
+                    loadingDiv.innerHTML = `<span style="color:#ff4444">请求已中断</span>`;
+                }
+            }
+
+            currentController = null;
+            currentLoadingWrapper = null;
+            setInputEnabled(true);
+            input.focus();
+        }
+
+        function addMessage(text, role, time) {
+            const w = document.createElement('div');
+            w.className = `message-wrapper ${role}`;
+            const m = document.createElement('div');
+            m.className = `message ${role}`;
+            m.innerHTML = renderContent(text);
+            const h = document.createElement('div');
+            h.className = 'message-header';
+            h.innerHTML = `
+                <span class="time">${time}</span>
+                <button class="tts-btn show" title="朗读">🔈</button>
+                <button class="fold-btn" title="折叠">▲ 折叠</button>
+            `;
+            w.appendChild(h);
+            w.appendChild(m);
+            w.querySelector('.tts-btn').onclick = () => speakText(text, w.querySelector('.tts-btn'));
+            w.querySelector('.fold-btn').onclick = (e) => toggleFold(e.target);
+            document.getElementById('messages').appendChild(w);
+            
+            setTimeout(()=>{
+                if(m.innerText.length > 300){
+                    m.classList.add('folded');
+                    w.classList.add('folded');
+                    h.querySelector('.fold-btn').textContent = '▼ 展开';
+                }
+            },100);
+            
+            scrollToBottom();
+        }
+
+        document.getElementById('userInput').addEventListener('keydown', e=>{
+            if(e.key==='Enter' && !e.shiftKey) {
+                e.preventDefault(); handleSendOrStop();
+            }
+        });
+
+        function handleSendBtnClick(e) {
+            e.preventDefault();
+            e.stopPropagation();
+            handleSendOrStop();
+        }
+
+        const sendBtn = document.getElementById('sendBtn');
+        sendBtn.addEventListener('click', handleSendBtnClick);
+        sendBtn.addEventListener('touchend', handleSendBtnClick);
+        sendBtn.addEventListener('touchstart', (e) => {
+            e.stopPropagation();
+        }, { passive: true });
+        
+        window.addEventListener('load',()=>{
+            setTimeout(()=>{
+                document.getElementById('userInput').focus();
+            },100);
+        });
+        
+        checkStatus();  // 初始化：检查服务器状态
+    </script>
+</body>
+</html>
+    <?php exit;}?>
